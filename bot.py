@@ -21,13 +21,13 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- MUSIC STORAGE ----------
+# ---------- STORAGE ----------
 queue = []
 history = []
 
 # ---------- YTDL ----------
 ytdl_format_options = {
-    "format": "bestaudio[ext=m4a]/bestaudio/best",
+    "format": "bestaudio/best",
     "quiet": True,
     "noplaylist": True,
     "default_search": "ytsearch",
@@ -58,7 +58,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         self.data = data
         self.title = data.get("title", "Unknown Title")
-        self.web_url = data.get("webpage_url")
+        self.web_url = data.get("webpage_url", "")
         self.thumbnail = data.get("thumbnail")
         self.duration = data.get("duration_string", "Unknown")
 
@@ -66,38 +66,57 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def from_query(cls, query):
         loop = asyncio.get_event_loop()
 
-        if not query.startswith("http"):
+        if not query.startswith(("http://", "https://")):
             query = f"ytsearch:{query}"
 
-        data = await loop.run_in_executor(
-            None,
-            lambda: ytdl.extract_info(query, download=False)
-        )
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: ytdl.extract_info(query, download=False)
+            )
 
-        if "entries" in data:
-            data = data["entries"][0]
+            if data is None:
+                raise Exception("No data returned from YouTube.")
 
-        if not data:
-            raise Exception("No song found.")
+            # If search result
+            if "entries" in data:
+                entries = data.get("entries")
+                if not entries:
+                    raise Exception("No song found.")
+                data = entries[0]
 
-        audio_url = None
+            if not data:
+                raise Exception("No song found.")
 
-        # Try direct url first
-        if data.get("url"):
-            audio_url = data["url"]
+            audio_url = None
 
-        # Fallback through formats
-        if not audio_url:
-            for fmt in reversed(data.get("formats", [])):
-                if fmt.get("acodec") != "none" and fmt.get("url"):
-                    audio_url = fmt["url"]
-                    break
+            # Try direct URL first
+            if data.get("url"):
+                audio_url = data["url"]
 
-        if not audio_url:
-            raise Exception("No playable audio format found.")
+            # Otherwise scan formats for a valid audio stream
+            if not audio_url:
+                for fmt in data.get("formats", []):
+                    if (
+                        fmt.get("url")
+                        and fmt.get("acodec") != "none"
+                    ):
+                        audio_url = fmt["url"]
 
-        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
-        return cls(source, data=data)
+                # fallback to any url if still not found
+                if not audio_url:
+                    for fmt in data.get("formats", []):
+                        if fmt.get("url"):
+                            audio_url = fmt["url"]
+
+            if not audio_url:
+                raise Exception("No playable audio format found for this video.")
+
+            source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
+            return cls(source, data=data)
+
+        except Exception as e:
+            raise Exception(str(e))
 
 
 # ---------- BUTTONS ----------
@@ -117,14 +136,14 @@ class MusicControls(View):
         current_song = history.pop()
         previous_song = history.pop()
 
-        queue.insert(0, current_song)
         queue.insert(0, previous_song)
+        queue.insert(1, current_song)
 
         if interaction.guild.voice_client:
             interaction.guild.voice_client.stop()
 
         await interaction.response.send_message(
-            "⏮ Going back to previous song...",
+            "⏮ Playing previous song...",
             ephemeral=True
         )
 
@@ -141,14 +160,14 @@ class MusicControls(View):
         if vc.is_playing():
             vc.pause()
             return await interaction.response.send_message(
-                "⏸ Paused.",
+                "⏸ Music paused.",
                 ephemeral=True
             )
 
         if vc.is_paused():
             vc.resume()
             return await interaction.response.send_message(
-                "▶ Resumed.",
+                "▶ Music resumed.",
                 ephemeral=True
             )
 
@@ -164,7 +183,7 @@ class MusicControls(View):
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
             return await interaction.response.send_message(
-                "⏭ Skipped.",
+                "⏭ Skipped current song.",
                 ephemeral=True
             )
 
@@ -179,23 +198,27 @@ async def play_next(ctx):
     if not queue:
         return
 
-    query = queue.pop(0)
-    history.append(query)
+    next_song = queue.pop(0)
+    history.append(next_song)
 
     try:
-        player = await YTDLSource.from_query(query)
+        player = await YTDLSource.from_query(next_song)
 
     except Exception as e:
         embed = discord.Embed(
-            description=f"❌ {e}",
+            description=f"❌ Failed to play: `{next_song}`\n```{e}```",
             color=0xFF0000
         )
         await ctx.send(embed=embed)
-        return await play_next(ctx)
+
+        # Continue with next song instead of stopping bot
+        if queue:
+            await play_next(ctx)
+        return
 
     def after_play(error):
         if error:
-            print(error)
+            print(f"Playback error: {error}")
 
         future = asyncio.run_coroutine_threadsafe(
             play_next(ctx),
@@ -205,7 +228,7 @@ async def play_next(ctx):
         try:
             future.result()
         except Exception as e:
-            print(e)
+            print(f"Queue error: {e}")
 
     ctx.voice_client.play(player, after=after_play)
 
@@ -213,7 +236,7 @@ async def play_next(ctx):
         description=(
             f"💜 **Now Playing**\n\n"
             f"**{player.title}**\n\n"
-            f"⏱️ `{player.duration}`\n"
+            f"⏱️ Duration: `{player.duration}`\n"
             f"👤 Requested by {ctx.author.mention}\n"
             f"🔗 [Open Song]({player.web_url})"
         ),
@@ -223,7 +246,7 @@ async def play_next(ctx):
     if player.thumbnail:
         embed.set_thumbnail(url=player.thumbnail)
 
-    embed.set_footer(text="Use the buttons below to control the player")
+    embed.set_footer(text="Use the buttons below to control the music")
 
     await ctx.send(embed=embed, view=MusicControls(ctx))
 
@@ -234,23 +257,23 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-# ---------- JOIN HELPER ----------
+# ---------- VOICE HELPER ----------
 async def ensure_voice(ctx):
-    if not ctx.author.voice:
+    if ctx.author.voice is None:
         embed = discord.Embed(
-            description="❌ Join a voice channel first.",
+            description="❌ You need to join a voice channel first.",
             color=0xFF0000
         )
         await ctx.send(embed=embed)
         return False
 
-    voice_channel = ctx.author.voice.channel
+    channel = ctx.author.voice.channel
 
-    if not ctx.voice_client:
-        await voice_channel.connect()
+    if ctx.voice_client is None:
+        await channel.connect()
 
-    elif ctx.voice_client.channel != voice_channel:
-        await ctx.voice_client.move_to(voice_channel)
+    elif ctx.voice_client.channel != channel:
+        await ctx.voice_client.move_to(channel)
 
     return True
 
@@ -279,7 +302,7 @@ async def p(ctx, *, query):
 
 
 @bot.command(name="queue")
-async def queue_cmd(ctx):
+async def queue_command(ctx):
     if not queue:
         embed = discord.Embed(
             description="📭 Queue is empty.",
@@ -287,14 +310,14 @@ async def queue_cmd(ctx):
         )
         return await ctx.send(embed=embed)
 
-    songs = "\n".join(
+    description = "\n".join(
         f"`{i + 1}.` {song}"
         for i, song in enumerate(queue[:10])
     )
 
     embed = discord.Embed(
-        title="📜 Queue",
-        description=songs,
+        title="📜 Current Queue",
+        description=description,
         color=0x2B2D31
     )
 
@@ -366,7 +389,7 @@ async def stop(ctx):
         ctx.voice_client.stop()
 
     embed = discord.Embed(
-        description="⏹ Queue cleared and playback stopped.",
+        description="⏹ Music stopped and queue cleared.",
         color=0x2B2D31
     )
     await ctx.send(embed=embed)
@@ -381,7 +404,7 @@ async def leave(ctx):
         await ctx.voice_client.disconnect()
 
     embed = discord.Embed(
-        description="👋 Disconnected from voice channel.",
+        description="👋 Left the voice channel.",
         color=0x2B2D31
     )
     await ctx.send(embed=embed)
