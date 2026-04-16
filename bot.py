@@ -123,10 +123,26 @@ class YTDLSource(discord.PCMVolumeTransformer):
             formats = data.get("formats", [])
             audio_url = None
 
-            for fmt in reversed(formats):
-                if fmt.get("url") and fmt.get("acodec") != "none":
-                    audio_url = fmt["url"]
-                    break
+            audio_formats = [
+                fmt for fmt in formats
+                if (
+                    fmt.get("url")
+                    and fmt.get("acodec") not in (None, "none")
+                    and fmt.get("vcodec") in (None, "none")
+                )
+            ]
+
+            if audio_formats:
+                audio_formats.sort(
+                    key=lambda x: x.get("abr") or x.get("tbr") or 0,
+                    reverse=True
+                )
+                audio_url = audio_formats[0]["url"]
+            else:
+                for fmt in formats:
+                    if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+                        audio_url = fmt["url"]
+                        break
 
             if not audio_url:
                 if data.get("url"):
