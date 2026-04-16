@@ -1,19 +1,19 @@
-import nacl
 import os
-from dotenv import load_dotenv
-
+import asyncio
 import discord
+import yt_dlp
+import nacl
+
+from dotenv import load_dotenv
 from discord.ext import commands
 from discord.ui import View
-import yt_dlp
-import asyncio
 
-# ---------- LOAD ENV ----------
+# ---------- LOAD TOKEN ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-if TOKEN is None:
-    raise ValueError("DISCORD_TOKEN not found in .env file")
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN not found in .env")
 
 # ---------- BOT SETUP ----------
 intents = discord.Intents.default()
@@ -21,13 +21,17 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- YTDL / FFMPEG ----------
+# ---------- MUSIC STORAGE ----------
+queue = []
+history = []
+
+# ---------- YTDL ----------
 ytdl_format_options = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
     "noplaylist": True,
     "default_search": "ytsearch",
-    "cookiefile": "cookies.txt",  # Make sure this file exists beside this script
+    "cookiefile": "cookies.txt",
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "web"]
@@ -41,14 +45,10 @@ ffmpeg_options = {
         "-reconnect_streamed 1 "
         "-reconnect_delay_max 5"
     ),
-    "options": "-vn",
+    "options": "-vn"
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
-
-# ---------- MUSIC STATE ----------
-queue = []
-history = []
 
 
 # ---------- AUDIO SOURCE ----------
@@ -58,41 +58,46 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         self.data = data
         self.title = data.get("title", "Unknown Title")
-        self.url = data.get("webpage_url")
+        self.web_url = data.get("webpage_url")
         self.thumbnail = data.get("thumbnail")
         self.duration = data.get("duration_string", "Unknown")
 
     @classmethod
-    async def from_url(cls, query, *, loop=None, stream=True):
-        loop = loop or asyncio.get_event_loop()
+    async def from_query(cls, query):
+        loop = asyncio.get_event_loop()
 
         if not query.startswith("http"):
             query = f"ytsearch:{query}"
 
-        try:
-            data = await loop.run_in_executor(
-                None,
-                lambda: ytdl.extract_info(query, download=not stream)
-            )
+        data = await loop.run_in_executor(
+            None,
+            lambda: ytdl.extract_info(query, download=False)
+        )
 
-            if data is None:
-                raise Exception("No data returned from yt-dlp")
+        if "entries" in data:
+            data = data["entries"][0]
 
-            if "entries" in data:
-                data = data["entries"][0]
+        if not data:
+            raise Exception("No song found.")
 
-            if data is None:
-                raise Exception("No search results found")
+        audio_url = None
 
-            filename = data["url"] if stream else ytdl.prepare_filename(data)
+        # Try direct url first
+        if data.get("url"):
+            audio_url = data["url"]
 
-            return cls(
-                discord.FFmpegPCMAudio(filename, **ffmpeg_options),
-                data=data
-            )
+        # Fallback through formats
+        if not audio_url:
+            for fmt in reversed(data.get("formats", [])):
+                if fmt.get("acodec") != "none" and fmt.get("url"):
+                    audio_url = fmt["url"]
+                    break
 
-        except Exception as e:
-            raise Exception(f"Failed to play song: {e}")
+        if not audio_url:
+            raise Exception("No playable audio format found.")
+
+        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
+        return cls(source, data=data)
 
 
 # ---------- BUTTONS ----------
@@ -109,17 +114,17 @@ class MusicControls(View):
                 ephemeral=True
             )
 
-        current = history.pop()
-        previous = history.pop()
+        current_song = history.pop()
+        previous_song = history.pop()
 
-        queue.insert(0, current)
-        queue.insert(0, previous)
+        queue.insert(0, current_song)
+        queue.insert(0, previous_song)
 
         if interaction.guild.voice_client:
             interaction.guild.voice_client.stop()
 
         await interaction.response.send_message(
-            "⏮ Playing previous song...",
+            "⏮ Going back to previous song...",
             ephemeral=True
         )
 
@@ -127,7 +132,7 @@ class MusicControls(View):
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
 
-        if vc is None:
+        if not vc:
             return await interaction.response.send_message(
                 "❌ Bot is not connected.",
                 ephemeral=True
@@ -135,23 +140,22 @@ class MusicControls(View):
 
         if vc.is_playing():
             vc.pause()
-            await interaction.response.send_message(
-                "⏸ Music paused.",
+            return await interaction.response.send_message(
+                "⏸ Paused.",
                 ephemeral=True
             )
 
-        elif vc.is_paused():
+        if vc.is_paused():
             vc.resume()
-            await interaction.response.send_message(
-                "▶ Music resumed.",
+            return await interaction.response.send_message(
+                "▶ Resumed.",
                 ephemeral=True
             )
 
-        else:
-            await interaction.response.send_message(
-                "❌ Nothing is playing.",
-                ephemeral=True
-            )
+        await interaction.response.send_message(
+            "❌ Nothing is playing.",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.success)
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -159,15 +163,15 @@ class MusicControls(View):
 
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
-            await interaction.response.send_message(
-                "⏭ Skipped current song.",
+            return await interaction.response.send_message(
+                "⏭ Skipped.",
                 ephemeral=True
             )
-        else:
-            await interaction.response.send_message(
-                "❌ Nothing is playing.",
-                ephemeral=True
-            )
+
+        await interaction.response.send_message(
+            "❌ Nothing is playing.",
+            ephemeral=True
+        )
 
 
 # ---------- PLAY NEXT ----------
@@ -175,15 +179,12 @@ async def play_next(ctx):
     if not queue:
         return
 
-    next_song = queue.pop(0)
-    history.append(next_song)
+    query = queue.pop(0)
+    history.append(query)
 
     try:
-        player = await YTDLSource.from_url(
-            next_song,
-            loop=bot.loop,
-            stream=True
-        )
+        player = await YTDLSource.from_query(query)
+
     except Exception as e:
         embed = discord.Embed(
             description=f"❌ {e}",
@@ -192,9 +193,9 @@ async def play_next(ctx):
         await ctx.send(embed=embed)
         return await play_next(ctx)
 
-    def after_playing(error):
+    def after_play(error):
         if error:
-            print(f"Player error: {error}")
+            print(error)
 
         future = asyncio.run_coroutine_threadsafe(
             play_next(ctx),
@@ -206,15 +207,15 @@ async def play_next(ctx):
         except Exception as e:
             print(e)
 
-    ctx.voice_client.play(player, after=after_playing)
+    ctx.voice_client.play(player, after=after_play)
 
     embed = discord.Embed(
         description=(
             f"💜 **Now Playing**\n\n"
             f"**{player.title}**\n\n"
-            f"⏱️ Duration: `{player.duration}`\n"
+            f"⏱️ `{player.duration}`\n"
             f"👤 Requested by {ctx.author.mention}\n"
-            f"🔗 [Open Song]({player.url})"
+            f"🔗 [Open Song]({player.web_url})"
         ),
         color=0x2B2D31
     )
@@ -222,25 +223,22 @@ async def play_next(ctx):
     if player.thumbnail:
         embed.set_thumbnail(url=player.thumbnail)
 
-    embed.set_footer(text="Use the buttons below to control the music")
+    embed.set_footer(text="Use the buttons below to control the player")
 
-    await ctx.send(
-        embed=embed,
-        view=MusicControls(ctx)
-    )
+    await ctx.send(embed=embed, view=MusicControls(ctx))
 
 
-# ---------- EVENTS ----------
+# ---------- READY ----------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-# ---------- COMMANDS ----------
-async def join_if_needed(ctx):
-    if ctx.author.voice is None:
+# ---------- JOIN HELPER ----------
+async def ensure_voice(ctx):
+    if not ctx.author.voice:
         embed = discord.Embed(
-            description="❌ You need to join a voice channel first.",
+            description="❌ Join a voice channel first.",
             color=0xFF0000
         )
         await ctx.send(embed=embed)
@@ -248,17 +246,19 @@ async def join_if_needed(ctx):
 
     voice_channel = ctx.author.voice.channel
 
-    if ctx.voice_client is None:
+    if not ctx.voice_client:
         await voice_channel.connect()
+
     elif ctx.voice_client.channel != voice_channel:
         await ctx.voice_client.move_to(voice_channel)
 
     return True
 
 
+# ---------- COMMANDS ----------
 @bot.command()
 async def play(ctx, *, query):
-    if not await join_if_needed(ctx):
+    if not await ensure_voice(ctx):
         return
 
     queue.append(query)
@@ -279,7 +279,7 @@ async def p(ctx, *, query):
 
 
 @bot.command(name="queue")
-async def queue_command(ctx):
+async def queue_cmd(ctx):
     if not queue:
         embed = discord.Embed(
             description="📭 Queue is empty.",
@@ -287,14 +287,14 @@ async def queue_command(ctx):
         )
         return await ctx.send(embed=embed)
 
-    description = "\n".join(
+    songs = "\n".join(
         f"`{i + 1}.` {song}"
         for i, song in enumerate(queue[:10])
     )
 
     embed = discord.Embed(
-        title="📜 Current Queue",
-        description=description,
+        title="📜 Queue",
+        description=songs,
         color=0x2B2D31
     )
 
@@ -313,13 +313,13 @@ async def skip(ctx):
             description="⏭ Skipped current song.",
             color=0x2B2D31
         )
-        await ctx.send(embed=embed)
     else:
         embed = discord.Embed(
             description="❌ Nothing is playing.",
             color=0xFF0000
         )
-        await ctx.send(embed=embed)
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -331,7 +331,13 @@ async def pause(ctx):
             description="⏸ Music paused.",
             color=0x2B2D31
         )
-        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            description="❌ Nothing is playing.",
+            color=0xFF0000
+        )
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -343,7 +349,13 @@ async def resume(ctx):
             description="▶ Music resumed.",
             color=0x2B2D31
         )
-        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            description="❌ Nothing is paused.",
+            color=0xFF0000
+        )
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -354,7 +366,7 @@ async def stop(ctx):
         ctx.voice_client.stop()
 
     embed = discord.Embed(
-        description="⏹ Music stopped and queue cleared.",
+        description="⏹ Queue cleared and playback stopped.",
         color=0x2B2D31
     )
     await ctx.send(embed=embed)
@@ -369,7 +381,7 @@ async def leave(ctx):
         await ctx.voice_client.disconnect()
 
     embed = discord.Embed(
-        description="👋 Left the voice channel.",
+        description="👋 Disconnected from voice channel.",
         color=0x2B2D31
     )
     await ctx.send(embed=embed)
