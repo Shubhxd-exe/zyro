@@ -30,11 +30,18 @@ ytdl_format_options = {
     "format": "bestaudio/best",
     "quiet": True,
     "noplaylist": True,
-    "default_search": "ytsearch",
+    "default_search": "ytsearch1",
     "cookiefile": "cookies.txt",
+    "source_address": "0.0.0.0",
+    "extract_flat": False,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "ignoreerrors": False,
+    "geo_bypass": True,
+    "geo_bypass_country": "US",
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"]
+            "player_client": ["android", "ios", "web"]
         }
     }
 }
@@ -60,14 +67,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get("title", "Unknown Title")
         self.web_url = data.get("webpage_url", "")
         self.thumbnail = data.get("thumbnail")
-        self.duration = data.get("duration_string", "Unknown")
+        self.duration = data.get("duration_string") or str(
+            data.get("duration", "Unknown")
+        )
 
     @classmethod
     async def from_query(cls, query):
         loop = asyncio.get_event_loop()
 
         if not query.startswith(("http://", "https://")):
-            query = f"ytsearch:{query}"
+            query = f"ytsearch1:{query}"
 
         try:
             data = await loop.run_in_executor(
@@ -75,44 +84,90 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 lambda: ytdl.extract_info(query, download=False)
             )
 
-            if data is None:
+            if not data:
                 raise Exception("No data returned from YouTube.")
 
-            # If search result
+            # Search result
             if "entries" in data:
-                entries = data.get("entries")
+                entries = [e for e in data.get("entries", []) if e]
+
                 if not entries:
                     raise Exception("No song found.")
+
                 data = entries[0]
 
+            # Get full info from actual video URL
+            if data.get("webpage_url"):
+                data = await loop.run_in_executor(
+                    None,
+                    lambda: ytdl.extract_info(
+                        data["webpage_url"],
+                        download=False
+                    )
+                )
+
             if not data:
-                raise Exception("No song found.")
+                raise Exception("Could not load video information.")
 
             audio_url = None
 
-            # Try direct URL first
-            if data.get("url"):
+            # Try direct audio URL
+            if data.get("url") and data.get("acodec") != "none":
                 audio_url = data["url"]
 
-            # Otherwise scan formats for a valid audio stream
+            # Try requested formats
             if not audio_url:
-                for fmt in data.get("formats", []):
+                for fmt in data.get("requested_formats", []):
+                    if (
+                        fmt
+                        and fmt.get("url")
+                        and fmt.get("acodec") != "none"
+                    ):
+                        audio_url = fmt["url"]
+                        break
+
+            # Find best audio-only format
+            if not audio_url:
+                formats = data.get("formats", [])
+
+                audio_formats = [
+                    f for f in formats
+                    if (
+                        f.get("url")
+                        and f.get("acodec") != "none"
+                        and f.get("vcodec") == "none"
+                    )
+                ]
+
+                if audio_formats:
+                    audio_formats.sort(
+                        key=lambda f: f.get("abr") or f.get("tbr") or 0,
+                        reverse=True
+                    )
+                    audio_url = audio_formats[0]["url"]
+
+            # Fallback: any format with audio
+            if not audio_url:
+                formats = data.get("formats", [])
+
+                for fmt in formats:
                     if (
                         fmt.get("url")
                         and fmt.get("acodec") != "none"
                     ):
                         audio_url = fmt["url"]
-
-                # fallback to any url if still not found
-                if not audio_url:
-                    for fmt in data.get("formats", []):
-                        if fmt.get("url"):
-                            audio_url = fmt["url"]
+                        break
 
             if not audio_url:
-                raise Exception("No playable audio format found for this video.")
+                raise Exception(
+                    "No playable audio format found for this video."
+                )
 
-            source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
+            source = discord.FFmpegPCMAudio(
+                audio_url,
+                **ffmpeg_options
+            )
+
             return cls(source, data=data)
 
         except Exception as e:
@@ -126,7 +181,11 @@ class MusicControls(View):
         self.ctx = ctx
 
     @discord.ui.button(label="⏮ Back", style=discord.ButtonStyle.secondary)
-    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
         if len(history) < 2:
             return await interaction.response.send_message(
                 "❌ No previous song available.",
@@ -147,8 +206,15 @@ class MusicControls(View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="⏯ Pause/Resume", style=discord.ButtonStyle.primary)
-    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="⏯ Pause/Resume",
+        style=discord.ButtonStyle.primary
+    )
+    async def pause_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
         vc = interaction.guild.voice_client
 
         if not vc:
@@ -177,11 +243,16 @@ class MusicControls(View):
         )
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.success)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def skip_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
         vc = interaction.guild.voice_client
 
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
+
             return await interaction.response.send_message(
                 "⏭ Skipped current song.",
                 ephemeral=True
@@ -206,12 +277,14 @@ async def play_next(ctx):
 
     except Exception as e:
         embed = discord.Embed(
-            description=f"❌ Failed to play: `{next_song}`\n```{e}```",
+            description=(
+                f"❌ Failed to play: `{next_song}`\n"
+                f"```{e}```"
+            ),
             color=0xFF0000
         )
         await ctx.send(embed=embed)
 
-        # Continue with next song instead of stopping bot
         if queue:
             await play_next(ctx)
         return
@@ -227,8 +300,8 @@ async def play_next(ctx):
 
         try:
             future.result()
-        except Exception as e:
-            print(f"Queue error: {e}")
+        except Exception as err:
+            print(f"Queue error: {err}")
 
     ctx.voice_client.play(player, after=after_play)
 
@@ -322,14 +395,19 @@ async def queue_command(ctx):
     )
 
     if len(queue) > 10:
-        embed.set_footer(text=f"And {len(queue) - 10} more songs...")
+        embed.set_footer(
+            text=f"And {len(queue) - 10} more songs..."
+        )
 
     await ctx.send(embed=embed)
 
 
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+    if ctx.voice_client and (
+        ctx.voice_client.is_playing()
+        or ctx.voice_client.is_paused()
+    ):
         ctx.voice_client.stop()
 
         embed = discord.Embed(
