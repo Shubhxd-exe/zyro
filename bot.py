@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import random
 import time
@@ -32,32 +33,25 @@ current_player = None
 current_song_query = None
 song_start_time = None
 
-# ---------- YTDL (FIXED FOR 403 / PO TOKEN ISSUES) ----------
+# ---------- YTDLP (RAILWAY + 403 FIXED) ----------
 ytdl_format_options = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
     "noplaylist": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-    "skip_download": True,
     "nocheckcertificate": True,
-    "ignoreerrors": False,
     "geo_bypass": True,
-    "extract_flat": False,
 
-    # 🔥 FIX: safer client usage (avoids PO token required formats)
+    # FIX: avoids PO token / mobile client errors
     "extractor_args": {
         "youtube": {
-            "player_client": ["web", "android"]
+            "player_client": ["web"]
         }
     },
 
     "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        )
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
 }
 
@@ -65,17 +59,13 @@ if os.path.exists("cookies.txt"):
     ytdl_format_options["cookiefile"] = "cookies.txt"
 
 ffmpeg_options = {
-    "before_options": (
-        "-reconnect 1 "
-        "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5"
-    ),
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin",
     "options": "-vn"
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
-# ---------- AUDIO SOURCE ----------
+# ---------- AUDIO ----------
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
@@ -84,7 +74,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.web_url = data.get("webpage_url", "")
         self.thumbnail = data.get("thumbnail")
         self.duration = data.get("duration_string") or str(data.get("duration", "Unknown"))
-        self.duration_secs = data.get("duration", 0)
         self.uploader = data.get("uploader") or data.get("channel", "Unknown")
 
     @classmethod
@@ -98,35 +87,23 @@ class YTDLSource(discord.PCMVolumeTransformer):
             )
 
             if not data:
-                raise Exception("No data returned from YouTube.")
+                raise Exception("No data found")
 
             if "entries" in data:
-                entries = [e for e in data.get("entries", []) if e]
+                entries = [e for e in data["entries"] if e]
                 if not entries:
-                    raise Exception("Song not found.")
+                    raise Exception("No results found")
                 data = entries[0]
 
-            if data.get("webpage_url"):
-                try:
-                    full_data = await loop.run_in_executor(
-                        None,
-                        lambda: ytdl.extract_info(data["webpage_url"], download=False)
-                    )
-                    if full_data:
-                        data = full_data
-                except:
-                    pass
-
-            # ---------- 🔥 FIX: safer audio selection ----------
+            # ---------- AUDIO PICK FIX ----------
             formats = data.get("formats", [])
             audio_url = None
 
-            # prefer clean audio-only formats
             audio_formats = [
-                fmt for fmt in formats
-                if fmt.get("url")
-                and fmt.get("acodec") not in (None, "none")
-                and fmt.get("vcodec") in (None, "none")
+                f for f in formats
+                if f.get("url")
+                and f.get("acodec") not in (None, "none")
+                and f.get("vcodec") in (None, "none")
             ]
 
             if audio_formats:
@@ -136,19 +113,17 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 )
                 audio_url = audio_formats[0]["url"]
 
-            # fallback 1
             if not audio_url:
-                for fmt in formats:
-                    if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
-                        audio_url = fmt["url"]
+                for f in formats:
+                    if f.get("url") and f.get("acodec") not in (None, "none"):
+                        audio_url = f["url"]
                         break
 
-            # fallback 2
             if not audio_url:
                 audio_url = data.get("url")
 
             if not audio_url:
-                raise Exception("No playable audio format found (YouTube restricted formats skipped).")
+                raise Exception("No playable audio stream found")
 
             source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
             return cls(source, data=data)
@@ -163,58 +138,58 @@ class MusicControls(View):
         self.ctx = ctx
 
     @discord.ui.button(label="⏮ Back", style=discord.ButtonStyle.secondary)
-    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def back_button(self, interaction, button):
         if len(history) < 2:
-            return await interaction.response.send_message("❌ No previous song available.", ephemeral=True)
+            return await interaction.response.send_message("❌ No previous song.", ephemeral=True)
 
-        current_song = history.pop()
-        previous_song = history.pop()
+        current = history.pop()
+        previous = history.pop()
 
-        queue.insert(0, previous_song)
-        queue.insert(1, current_song)
+        queue.insert(0, previous)
+        queue.insert(1, current)
 
         if interaction.guild.voice_client:
             interaction.guild.voice_client.stop()
 
-        await interaction.response.send_message("⏮ Playing previous song...", ephemeral=True)
+        await interaction.response.send_message("⏮ Back playing...", ephemeral=True)
 
     @discord.ui.button(label="⏯ Pause/Resume", style=discord.ButtonStyle.primary)
-    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def pause_button(self, interaction, button):
         vc = interaction.guild.voice_client
 
         if not vc:
-            return await interaction.response.send_message("❌ Bot is not connected.", ephemeral=True)
+            return await interaction.response.send_message("❌ Not connected", ephemeral=True)
 
         if vc.is_playing():
             vc.pause()
-            return await interaction.response.send_message("⏸ Music paused.", ephemeral=True)
+            return await interaction.response.send_message("⏸ Paused", ephemeral=True)
 
         if vc.is_paused():
             vc.resume()
-            return await interaction.response.send_message("▶ Music resumed.", ephemeral=True)
+            return await interaction.response.send_message("▶ Resumed", ephemeral=True)
 
-        await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        await interaction.response.send_message("❌ Nothing playing", ephemeral=True)
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.success)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def skip_button(self, interaction, button):
         vc = interaction.guild.voice_client
 
-        if vc and (vc.is_playing() or vc.is_paused()):
+        if vc:
             vc.stop()
-            return await interaction.response.send_message("⏭ Skipped current song.", ephemeral=True)
+            return await interaction.response.send_message("⏭ Skipped", ephemeral=True)
 
-        await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        await interaction.response.send_message("❌ Nothing playing", ephemeral=True)
 
     @discord.ui.button(label="🔁 Loop", style=discord.ButtonStyle.secondary)
-    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def loop_button(self, interaction, button):
         global loop_enabled
         loop_enabled = not loop_enabled
         await interaction.response.send_message(
-            f"Loop {'enabled 🔁' if loop_enabled else 'disabled'}.",
+            f"Loop {'ON 🔁' if loop_enabled else 'OFF'}",
             ephemeral=True
         )
 
-# ---------- PLAY NEXT ----------
+# ---------- PLAY ----------
 async def play_next(ctx):
     global current_player, current_song_query, song_start_time
 
@@ -234,38 +209,26 @@ async def play_next(ctx):
     try:
         player = await YTDLSource.from_query(next_song)
     except Exception as e:
-        await ctx.send(embed=discord.Embed(
-            title="❌ Failed To Play Song",
-            description=f"```{e}```",
-            color=0xFF0000
-        ))
+        await ctx.send(f"❌ Error: {e}")
         if queue:
             await play_next(ctx)
         return
 
     current_player = player
 
-    def after_play(error):
+    def after(error):
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
-    ctx.voice_client.play(player, after=after_play)
+    ctx.voice_client.play(player, after=after)
 
     embed = discord.Embed(
         title="🎶 Now Playing",
-        description=(
-            f"**{player.title}**\n\n"
-            f"⏱ Duration: `{player.duration}`\n"
-            f"🎤 Uploader: `{player.uploader}`\n"
-            f"👤 Requested by: {ctx.author.mention}"
-        ),
+        description=f"**{player.title}**\n🎤 {player.uploader}\n👤 {ctx.author.mention}",
         color=0x2B2D31
     )
 
     if player.thumbnail:
         embed.set_thumbnail(url=player.thumbnail)
-
-    if player.web_url:
-        embed.add_field(name="Link", value=f"[Open Song]({player.web_url})", inline=False)
 
     await ctx.send(embed=embed, view=MusicControls(ctx))
 
@@ -274,10 +237,13 @@ async def play_next(ctx):
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
+    # Railway keep alive
+    bot.loop.create_task(asyncio.sleep(0))
+
 # ---------- VOICE ----------
 async def ensure_voice(ctx):
     if not ctx.author.voice:
-        await ctx.send("❌ Join a voice channel first.")
+        await ctx.send("❌ Join a voice channel first")
         return False
 
     channel = ctx.author.voice.channel
@@ -296,10 +262,9 @@ async def play(ctx, *, query):
         return
 
     queue.append(query)
+    await ctx.send(f"➕ Added: `{query}`")
 
-    await ctx.send(f"➕ Added to queue: `{query}`")
-
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+    if not ctx.voice_client.is_playing():
         await play_next(ctx)
 
 @bot.command()
