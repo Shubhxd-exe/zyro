@@ -1,7 +1,3 @@
 discord.py
-yt-dlp
+wavelink
 python-dotenv
-PyNaCl
-davey
-ffmpeg-python
-discord.py[voice]
