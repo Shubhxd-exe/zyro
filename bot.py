@@ -47,8 +47,8 @@ async def on_ready():
     # Prevent reconnect spam
     if not wavelink.Pool.nodes:
         node = wavelink.Node(
-            uri="https://YOUR-RAILWAY-URL.up.railway.app",
-            password="youshallnotpass"
+            uri="ws://paid1.spidercloud.fun:25575",
+            password="lavalinknode88"
         )
         await wavelink.Pool.connect(nodes=[node], client=bot)
 
