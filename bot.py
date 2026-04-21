@@ -1,38 +1,79 @@
 import os
-import asyncio
 import random
-import time
 import discord
 import wavelink
 
 from dotenv import load_dotenv
 from discord.ext import commands
-from discord.ui import View
+from discord.ui import View, button
 
-# ---------- LOAD TOKEN ----------
+# ─────────────────────────────────────────────
+# ENVIRONMENT
+# ─────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN not found in .env")
 
-# ---------- BOT SETUP ----------
+# ─────────────────────────────────────────────
+# BOT SETUP
+# ─────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
-# ---------- STORAGE ----------
-queue = []
-history = []
-loop_enabled = False
-current_player = None
-current_song_query = None
-song_start_time = None
+song_queue: dict[int, list] = {}
+loop_mode: dict[int, bool] = {}
 
 
-# ---------- LAVALINK CONNECT ----------
+# ─────────────────────────────────────────────
+# CONTROL BUTTONS
+# ─────────────────────────────────────────────
+class MusicControls(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="⏯", style=discord.ButtonStyle.primary)
+    async def pause_resume(self, interaction: discord.Interaction, _):
+        player: wavelink.Player = interaction.guild.voice_client
+
+        if not player:
+            return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+
+        if player.paused:
+            await player.pause(False)
+            return await interaction.response.send_message("▶ Resumed.", ephemeral=True)
+
+        await player.pause(True)
+        await interaction.response.send_message("⏸ Paused.", ephemeral=True)
+
+    @button(label="⏭", style=discord.ButtonStyle.success)
+    async def skip(self, interaction: discord.Interaction, _):
+        player: wavelink.Player = interaction.guild.voice_client
+
+        if not player or not player.current:
+            return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+
+        await player.skip(force=True)
+        await interaction.response.send_message("⏭ Skipped.", ephemeral=True)
+
+    @button(label="🔁", style=discord.ButtonStyle.secondary)
+    async def loop(self, interaction: discord.Interaction, _):
+        gid = interaction.guild.id
+        loop_mode[gid] = not loop_mode.get(gid, False)
+
+        await interaction.response.send_message(
+            f"🔁 Loop {'enabled' if loop_mode[gid] else 'disabled'}.",
+            ephemeral=True
+        )
+
+
+# ─────────────────────────────────────────────
+# READY + LAVALINK
+# ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -40,251 +81,174 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening,
-            name="!play music"
+            name="!play"
         )
     )
 
-    # Prevent reconnect spam
     if not wavelink.Pool.nodes:
-        node = wavelink.Node(
-            uri="ws://paid1.spidercloud.fun:25575",
-            password="lavalinknode88"
+        await wavelink.Pool.connect(
+            nodes=[
+                wavelink.Node(
+                    uri="ws://paid1.spidercloud.fun:25575",
+                    password="lavalinknode88"
+                )
+            ],
+            client=bot
         )
-        await wavelink.Pool.connect(nodes=[node], client=bot)
 
 
-# ---------- BUTTONS ----------
-class MusicControls(View):
-    def __init__(self, ctx):
-        super().__init__(timeout=None)
-        self.ctx = ctx
+# ─────────────────────────────────────────────
+# TRACK END EVENT
+# ─────────────────────────────────────────────
+@bot.event
+async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
+    player: wavelink.Player = payload.player
+    guild_id = player.guild.id
 
-    @discord.ui.button(label="⏮ Back", style=discord.ButtonStyle.secondary)
-    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if len(history) < 2:
-            return await interaction.response.send_message(
-                "❌ No previous song available.",
-                ephemeral=True
-            )
-
-        current_song = history.pop()
-        previous_song = history.pop()
-
-        queue.insert(0, previous_song)
-        queue.insert(1, current_song)
-
-        vc = interaction.guild.voice_client
-        if vc:
-            vc.stop()
-
-        await interaction.response.send_message("⏮ Playing previous song...", ephemeral=True)
-
-    @discord.ui.button(label="⏯ Pause/Resume", style=discord.ButtonStyle.primary)
-    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-
-        if not vc:
-            return await interaction.response.send_message("❌ Bot is not connected.", ephemeral=True)
-
-        if vc.is_playing():
-            vc.pause()
-            return await interaction.response.send_message("⏸ Music paused.", ephemeral=True)
-
-        if vc.is_paused():
-            vc.resume()
-            return await interaction.response.send_message("▶ Music resumed.", ephemeral=True)
-
-        await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
-
-    @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.success)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-            return await interaction.response.send_message("⏭ Skipped current song.", ephemeral=True)
-
-        await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
-
-    @discord.ui.button(label="🔁 Loop", style=discord.ButtonStyle.secondary)
-    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        global loop_enabled
-
-        loop_enabled = not loop_enabled
-        state = "enabled 🔁" if loop_enabled else "disabled"
-
-        await interaction.response.send_message(f"Loop {state}.", ephemeral=True)
-
-
-# ---------- PLAY NEXT ----------
-async def play_next(ctx):
-    global current_player, current_song_query, song_start_time
-
-    if loop_enabled and current_song_query:
-        queue.insert(0, current_song_query)
-
-    if not queue:
-        current_player = None
-        current_song_query = None
+    if loop_mode.get(guild_id, False) and payload.track:
+        await player.play(payload.track)
         return
 
-    next_song = queue.pop(0)
-    history.append(next_song)
-    current_song_query = next_song
-    song_start_time = time.time()
+    queue = song_queue.get(guild_id, [])
 
-    try:
-        tracks = await wavelink.YouTubeTrack.search(next_song)
+    if queue:
+        next_track = queue.pop(0)
+        await player.play(next_track)
 
-        if not tracks:
-            await ctx.send("❌ Song not found.")
-            return
 
-        track = tracks[0]
-        current_player = track
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+async def get_player(ctx) -> wavelink.Player | None:
+    if not ctx.author.voice:
+        await ctx.send("❌ Join a voice channel first.")
+        return None
 
-    except Exception as e:
-        await ctx.send(f"❌ Error: `{e}`")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
+    elif player.channel != ctx.author.voice.channel:
+        await player.move_to(ctx.author.voice.channel)
+
+    return player
+
+
+# ─────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────
+@bot.command(aliases=["p"])
+async def play(ctx, *, query: str):
+    player = await get_player(ctx)
+
+    if not player:
         return
 
-    def after_play(error):
-        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+    results = await wavelink.Playable.search(query)
 
-    vc = ctx.voice_client
-    await vc.play(track, after=after_play)
+    if not results:
+        return await ctx.send("❌ No results found.")
+
+    if isinstance(results, wavelink.Playlist):
+        track = results.tracks[0]
+    else:
+        track = results[0]
+
+    guild_queue = song_queue.setdefault(ctx.guild.id, [])
+
+    if player.current:
+        guild_queue.append(track)
+        return await ctx.send(f"➕ Added to queue: **{track.title}**")
+
+    await player.play(track)
 
     embed = discord.Embed(
         title="🎶 Now Playing",
-        description=(
-            f"**{track.title}**\n\n"
-            f"👤 Requested by: {ctx.author.mention}"
-        ),
+        description=f"**{track.title}**\n\nRequested by {ctx.author.mention}",
         color=0x2B2D31
     )
 
-    if getattr(track, "thumbnail", None):
-        embed.set_thumbnail(url=track.thumbnail)
+    artwork = getattr(track, "artwork", None)
+    if artwork:
+        embed.set_thumbnail(url=artwork)
 
-    await ctx.send(embed=embed, view=MusicControls(ctx))
-
-
-# ---------- VOICE HELPER ----------
-async def ensure_voice(ctx):
-    if not ctx.author.voice:
-        await ctx.send(embed=discord.Embed(
-            description="❌ Join a voice channel first.",
-            color=0xFF0000
-        ))
-        return False
-
-    channel = ctx.author.voice.channel
-
-    if not ctx.voice_client:
-        await channel.connect(cls=wavelink.Player)
-    elif ctx.voice_client.channel != channel:
-        await ctx.voice_client.move_to(channel)
-
-    return True
-
-
-# ---------- COMMANDS ----------
-@bot.command()
-async def play(ctx, *, query):
-    if not await ensure_voice(ctx):
-        return
-
-    queue.append(query)
-
-    await ctx.send(embed=discord.Embed(
-        description=f"➕ Added to queue: `{query}`",
-        color=0x2B2D31
-    ))
-
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-        await play_next(ctx)
-
-
-@bot.command()
-async def p(ctx, *, query):
-    await play(ctx, query=query)
-
-
-@bot.command(name="queue")
-async def queue_command(ctx):
-    if not queue:
-        return await ctx.send(embed=discord.Embed(
-            description="📭 Queue is empty.",
-            color=0x2B2D31
-        ))
-
-    desc = "\n".join(f"`{i+1}.` {song}" for i, song in enumerate(queue[:10]))
-
-    await ctx.send(embed=discord.Embed(
-        title="📜 Current Queue",
-        description=desc,
-        color=0x2B2D31
-    ))
+    await ctx.send(embed=embed, view=MusicControls())
 
 
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-        await ctx.send("⏭ Skipped.")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player or not player.current:
+        return await ctx.send("❌ Nothing is playing.")
+
+    await player.skip(force=True)
+    await ctx.send("⏭ Skipped.")
 
 
 @bot.command()
 async def pause(ctx):
-    if ctx.voice_client:
-        ctx.voice_client.pause()
-        await ctx.send("⏸ Paused.")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        return await ctx.send("❌ Not connected.")
+
+    await player.pause(True)
+    await ctx.send("⏸ Paused.")
 
 
 @bot.command()
 async def resume(ctx):
-    if ctx.voice_client:
-        ctx.voice_client.resume()
-        await ctx.send("▶ Resumed.")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        return await ctx.send("❌ Not connected.")
+
+    await player.pause(False)
+    await ctx.send("▶ Resumed.")
 
 
 @bot.command()
 async def stop(ctx):
-    queue.clear()
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-    await ctx.send("⏹ Stopped.")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        return await ctx.send("❌ Not connected.")
+
+    song_queue[ctx.guild.id] = []
+    await player.stop()
+    await ctx.send("⏹ Stopped and cleared queue.")
 
 
 @bot.command()
 async def leave(ctx):
-    queue.clear()
-    history.clear()
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-    await ctx.send("👋 Left voice channel.")
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        return await ctx.send("❌ Not connected.")
+
+    song_queue.pop(ctx.guild.id, None)
+    loop_mode.pop(ctx.guild.id, None)
+
+    await player.disconnect()
+    await ctx.send("👋 Disconnected.")
 
 
-@bot.command()
-async def volume(ctx, vol: int):
-    vol = max(0, min(vol, 100))
+@bot.command(name="queue")
+async def queue_cmd(ctx):
+    queue = song_queue.get(ctx.guild.id, [])
 
-    if ctx.voice_client:
-        try:
-            await ctx.voice_client.set_volume(vol)
-        except:
-            pass
+    if not queue:
+        return await ctx.send("📭 Queue is empty.")
 
-    await ctx.send(f"🔊 Volume set to {vol}%")
-
-
-@bot.command(aliases=["np"])
-async def nowplaying(ctx):
-    if not current_player:
-        return await ctx.send("❌ Nothing playing.")
+    description = "\n".join(
+        f"`{i + 1}.` {track.title}"
+        for i, track in enumerate(queue[:10])
+    )
 
     embed = discord.Embed(
-        title="🎵 Now Playing",
-        description=f"**{current_player.title}**",
+        title="📜 Queue",
+        description=description,
         color=0x2B2D31
     )
 
@@ -293,29 +257,56 @@ async def nowplaying(ctx):
 
 @bot.command()
 async def shuffle(ctx):
+    queue = song_queue.get(ctx.guild.id, [])
+
+    if not queue:
+        return await ctx.send("📭 Queue is empty.")
+
     random.shuffle(queue)
-    await ctx.send("🔀 Shuffled queue.")
+    await ctx.send("🔀 Queue shuffled.")
+
+
+@bot.command()
+async def volume(ctx, amount: int):
+    player: wavelink.Player = ctx.voice_client
+
+    if not player:
+        return await ctx.send("❌ Not connected.")
+
+    amount = max(0, min(amount, 100))
+    await player.set_volume(amount)
+
+    await ctx.send(f"🔊 Volume set to {amount}%")
+
+
+@bot.command(aliases=["np"])
+async def nowplaying(ctx):
+    player: wavelink.Player = ctx.voice_client
+
+    if not player or not player.current:
+        return await ctx.send("❌ Nothing is playing.")
+
+    track = player.current
+
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"**{track.title}**",
+        color=0x2B2D31
+    )
+
+    artwork = getattr(track, "artwork", None)
+    if artwork:
+        embed.set_thumbnail(url=artwork)
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
 async def loop(ctx):
-    global loop_enabled
-    loop_enabled = not loop_enabled
-    await ctx.send(f"🔁 Loop {'enabled' if loop_enabled else 'disabled'}")
+    gid = ctx.guild.id
+    loop_mode[gid] = not loop_mode.get(gid, False)
 
-
-@bot.command()
-async def history(ctx):
-    if not history:
-        return await ctx.send("📭 No history.")
-
-    desc = "\n".join(f"`{i+1}.` {s}" for i, s in enumerate(history[-10:][::-1]))
-
-    await ctx.send(embed=discord.Embed(
-        title="🕘 History",
-        description=desc,
-        color=0x2B2D31
-    ))
+    await ctx.send(f"🔁 Loop {'enabled' if loop_mode[gid] else 'disabled'}")
 
 
 @bot.command(name="help")
@@ -327,18 +318,20 @@ async def help_command(ctx):
 
     embed.add_field(
         name="Playback",
-        value="`!play` `!skip` `!pause` `!resume` `!stop` `!leave`",
+        value="`!play` `!pause` `!resume` `!skip` `!stop` `!leave`",
         inline=False
     )
 
     embed.add_field(
         name="Queue",
-        value="`!queue` `!shuffle` `!history` `!loop`",
+        value="`!queue` `!shuffle` `!loop` `!volume` `!nowplaying`",
         inline=False
     )
 
     await ctx.send(embed=embed)
 
 
-# ---------- RUN ----------
+# ─────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────
 bot.run(TOKEN)
